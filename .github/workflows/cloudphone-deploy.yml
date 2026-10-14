@@ -303,6 +303,141 @@ jobs:
           CP_PUBLIC_KEY
           chmod 0644 "$work/access-public.pem"
           openssl pkey -pubin -in "$work/access-public.pem" -noout
+
+          install -d -o root -g root -m 0700 /run/cloudphone-public-test
+          cat > "$work/backend.mjs" <<'CP_BACKEND'
+          import fs from 'node:fs/promises';
+          const report = (label, error) => console.error(label, error?.stack || String(error), { code: error?.code, cause: error?.cause });
+          async function probe(label, factory) {
+            let target;
+            try { target = await factory(); } catch (error) { report(label + '.initialize', error); return; }
+            for (const operation of ['capabilities', 'list', 'usage']) {
+              try { console.log(label + '.' + operation, JSON.stringify(await target[operation]())); }
+              catch (error) { report(label + '.' + operation, error); }
+            }
+          }
+          await probe('PhoneManager', async () => {
+            const config = JSON.parse(await fs.readFile('/etc/cloudphone-platform/config.json', 'utf8'));
+            const { PhoneManager } = await import('/opt/cloudphone-platform/lib/isolation.mjs');
+            return new PhoneManager({ stateDir: config.stateDir, sdkDir: config.sdkDir, config });
+          });
+          await probe('BrokerClient', async () => {
+            const { BrokerClient } = await import('/opt/cloudphone-platform/lib/broker-client.mjs');
+            return new BrokerClient({ timeoutMs: 10000 });
+          });
+          CP_BACKEND
+          # --pipe keeps child streams out of the journal; RuntimeMaxSec also kills the
+          # transient cgroup if the outer timeout loses its waiting client.
+          (
+            caps=$(systemctl show cloudphone-platform-broker.service --property=CapabilityBoundingSet --value)
+            test -n "$caps" || { echo 'Installed broker CapabilityBoundingSet unavailable'; exit 1; }
+            timeout --kill-after=5s 90s systemd-run --wait --pipe --collect \
+              --unit="cloudphone-public-diagnostics-$$" \
+              --property=User=root --property=Group=cloudphone-web --property=UMask=0077 \
+              --property=NoNewPrivileges=yes --property=RestrictSUIDSGID=yes \
+              --property=LockPersonality=yes --property=RestrictRealtime=yes \
+              --property="CapabilityBoundingSet=$caps" --property=RuntimeMaxSec=85s \
+              --property=TimeoutStopSec=3s --property=KillMode=control-group \
+              --property=WorkingDirectory=/opt/cloudphone-platform \
+              --setenv=CONFIG_FILE=/etc/cloudphone-platform/config.json \
+              /usr/bin/node "$work/backend.mjs"
+            result=$?
+            printf 'Transient probe exit status: %s\n' "$result"
+            exit "$result"
+          ) > /run/cloudphone-public-test/backend.log 2>&1 || true
+          chmod 0600 /run/cloudphone-public-test/backend.log
+          # Directory-relative opens with O_NOFOLLOW reject links at every path component.
+          # Bound traversal, records and tails; never read disk images or recurse symlinks.
+          python3 - "$work/bundle" <<'CP_STATE'
+          import json, os, stat, sys, traceback
+          from pathlib import Path
+          out = Path(sys.argv[1]) / 'state'
+          out.mkdir(mode=0o700)
+          D = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+          F = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+          budget = 4096
+          copied = 0
+
+          def directory(path):
+              if not isinstance(path, str) or not path.startswith('/') or '..' in path.split('/'):
+                  raise ValueError('Invalid installed stateDir')
+              fd = os.open('/', D)
+              try:
+                  for part in filter(None, path.split('/')):
+                      child = os.open(part, D, dir_fd=fd)
+                      os.close(fd)
+                      fd = child
+                  return fd
+              except BaseException:
+                  os.close(fd)
+                  raise
+
+          def walk(fd, parts, inventory):
+              global budget, copied
+              with os.scandir(fd) as entries:
+                  for entry in entries:
+                      if budget <= 0:
+                          return
+                      budget -= 1
+                      name = entry.name
+                      rel = parts + [name]
+                      try:
+                          st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                          inventory.write(json.dumps({'path': '/'.join(rel), 'mode': oct(stat.S_IMODE(st.st_mode)),
+                              'type': stat.S_IFMT(st.st_mode), 'size': st.st_size, 'uid': st.st_uid, 'gid': st.st_gid}) + '\n')
+                          if stat.S_ISDIR(st.st_mode) and len(rel) < 5:
+                              child = os.open(name, D, dir_fd=fd)
+                              try:
+                                  walk(child, rel, inventory)
+                              finally:
+                                  os.close(child)
+                          elif stat.S_ISREG(st.st_mode):
+                              record = len(rel) <= 2 and name.endswith('.json')
+                              log = len(rel) >= 3 and rel[1] == 'volume' and name.endswith('.log')
+                              if not (record or log) or copied >= 128:
+                                  continue
+                              source = os.open(name, F, dir_fd=fd)
+                              try:
+                                  current = os.fstat(source)
+                                  if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino):
+                                      raise ValueError('File changed during capture')
+                                  if record and current.st_size > 1024 * 1024:
+                                      inventory.write(json.dumps({'skipped': '/'.join(rel), 'reason': 'JSON exceeds 1 MiB'}) + '\n')
+                                      continue
+                                  if log:
+                                      os.lseek(source, max(0, current.st_size - 65536), os.SEEK_SET)
+                                  data = os.read(source, 65536 if log else 1024 * 1024)
+                                  if log:
+                                      data = b'\n'.join(data.split(b'\n')[-201:])
+                                  target = out.joinpath('files', *rel)
+                                  target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                                  target.write_bytes(data)
+                                  copied += 1
+                              finally:
+                                  os.close(source)
+                      except Exception:
+                          traceback.print_exc(file=inventory)
+
+          with (out / 'inventory.jsonl').open('w') as inventory:
+              try:
+                  with open('/etc/cloudphone-platform/config.json') as config_file:
+                      config = json.load(config_file)
+                  fd = directory(config['stateDir'])
+                  try:
+                      st = os.fstat(fd)
+                      inventory.write(json.dumps({'stateDir': config['stateDir'], 'mode': oct(stat.S_IMODE(st.st_mode)), 'size': st.st_size}) + '\n')
+                      walk(fd, [], inventory)
+                      inventory.write(json.dumps({'entryLimitReached': budget <= 0, 'copiedFiles': copied, 'fileLimit': 128, 'maxDepth': 5}) + '\n')
+                  finally:
+                      os.close(fd)
+              except Exception:
+                  traceback.print_exc(file=inventory)
+          CP_STATE
+          # Include loaded and historical phone units, bounded in both lines and bytes.
+          # The journal glob also finds units no longer loaded after a failed start.
+          timeout --kill-after=3s 20s journalctl -u 'cloudphone-*.service' -b --lines=2000 --no-pager --output=short-iso 2>&1 \
+            | head -c 4194304 > "$work/bundle/systemd/phone-units.log" || true
+
           # Copy only regular files, never follow symlinks or include directories recursively.
           if [ -d /run/cloudphone-public-test ] && [ ! -L /run/cloudphone-public-test ]; then
             find /run/cloudphone-public-test -maxdepth 1 -type f \( -name '*.log' -o -name 'preflight.json' -o -name 'managed-url' \) -exec cp --no-dereference --target-directory="$work/bundle/logs" -- {} +
