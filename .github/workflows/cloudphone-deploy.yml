@@ -111,6 +111,19 @@ jobs:
             exit 1
           fi
           echo "[OK] Runner host normalized - secure_path normalization complete; official preflight still required."
+          echo '[FIX] Removing inherited default ACLs that can override installer umask on the ephemeral runner...'
+          sudo python3 - <<'CP_ACL'
+          import errno, os
+          for path in ('/opt', '/var/lib', '/etc'):
+              try:
+                  os.removexattr(path, 'system.posix_acl_default')
+                  print('[FIX] Removed default ACL:', path)
+              except OSError as error:
+                  if error.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+                      raise
+          CP_ACL
+          sudo bash -c 'set -e; umask 077; for d in /opt /var/lib /etc; do f="$d/.cloudphone-private-mode-test.$$"; : > "$f"; [ "$(stat -c %a "$f")" = 600 ]; rm -f "$f"; done'
+          echo '[OK] Installer parent directories create private files as 0600.'
       - name: Resolve Source Commit (before all official downloads)
         run: |
           set -euo pipefail
