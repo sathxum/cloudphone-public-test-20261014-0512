@@ -1,0 +1,346 @@
+name: Proton Cloudphone Public Test (STANDALONE)
+'on':
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - .github/workflows/cloudphone-deploy.yml
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Preflight Environment Check
+        run: |
+          echo "======================================================"
+          echo "   PROTON CLOUDPHONE // STANDALONE // ANDROID 16"
+          echo "======================================================="
+          echo "[INFO] Arch : $(uname -m)"
+          echo "[INFO] OS   : $(lsb_release -ds 2>/dev/null || head -1 /etc/os-release)"
+          echo "[INFO] PID1 : $(cat /proc/1/comm)"
+          if [ -e /dev/kvm ]; then
+            echo "[OK] KVM acceleration device present."
+          else
+            echo "[WARN] /dev/kvm not present - phone creation may be rejected by the platform."
+          fi
+          echo "[INFO] Disk space:"
+          df -h / /opt /var/lib 2>/dev/null || df -h /
+          echo "[INFO] Node: $(node --version 2>/dev/null || echo 'not found')"
+          echo '[INFO] Memory (kB):'
+          grep -E '^Mem(Total|Available):' /proc/meminfo
+          ls -l /dev/kvm 2>/dev/null || true
+          if sudo test -r /dev/kvm && sudo test -w /dev/kvm; then echo '[OK] Root can read/write KVM'; else echo '[WARN] Root cannot read/write KVM'; fi
+      - name: Free Runner Disk Space (50 GiB Preflight Requirement)
+        run: |
+          echo "[INFO] Disk before cleanup:"
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup 2>/dev/null || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby 2>/dev/null || true
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
+          echo "[INFO] Disk after cleanup:"
+          df -h / | tail -1
+      - name: Normalize Runner Host (secure_path Compliance)
+        run: |
+          echo "[INFO] Hosted runner images ship /usr/local/bin 0777 AND run 'chmod -R 777"
+          echo "[INFO] /usr/local/lib/node_modules' (runner-images issue #267). The platform"
+          echo "[INFO] secure_path() rejects group/other-writable FILES as well as dirs -"
+          echo "[INFO] including /usr/local/bin/node itself and npm's resolved module tree."
+          echo "[INFO] Pre-fix state:"
+          ls -ld /usr/local /usr/local/bin /usr/local/bin/node /usr/local/bin/npm /usr/local/lib /usr/local/lib/node_modules /opt /usr/bin /srv 2>/dev/null || true
+          FAIL=0
+          heal_dir() {
+            if [ ! -d "$1" ]; then
+              echo "[FIX] $1 missing - creating root-owned 0755 directory."
+              sudo install -d -o root -g root -m 0755 "$1"
+            else
+              sudo chown root:root "$1" 2>/dev/null || true
+              sudo chmod 0755 "$1" 2>/dev/null || true
+            fi
+          }
+          BASE_DIRS="/usr/local /usr/local/bin /usr/local/lib /opt /usr/bin /var /var/lib /etc /etc/systemd /etc/systemd/system /srv"
+          for P in $BASE_DIRS; do heal_dir "$P" || { echo "[ERROR] Heal failed for $P"; FAIL=1; }; done
+          echo "[FIX] Repairing /usr/local/lib/node_modules tree (root-owned, strip group/other write)..."
+          if [ -d /usr/local/lib/node_modules ]; then
+            sudo chown -R root:root /usr/local/lib/node_modules
+            sudo chmod -R go-w /usr/local/lib/node_modules
+          fi
+          echo "[FIX] Strip group/other write from every binary in /usr/local/bin (node/npm are 0777)..."
+          sudo chmod go-w /usr/local/bin/* 2>/dev/null || true
+          echo "[INFO] Verifying with an exact mirror of the installer's secure_path()..."
+          verify_secure_path() {
+            P=$(readlink -e -- "$1" 2>/dev/null) || { echo "[ERROR] Missing/unresolvable: $1"; FAIL=1; return 1; }
+            while :; do
+              OWN=$(stat -c %u -- "$P" 2>/dev/null || echo MISSING)
+              WR=$(find "$P" -maxdepth 0 -perm /022 -print 2>/dev/null || true)
+              if [ "$OWN" != "0" ] || [ -n "$WR" ]; then
+                echo "[ERROR] secure_path would reject: $P (owner=$OWN writable=${WR:-no})"
+                FAIL=1
+                return 1
+              fi
+              echo "[OK] $P compliant"
+              [ "$P" != "/" ] || return 0
+              P=$(dirname -- "$P")
+            done
+            return 0
+          }
+          for P in /usr/bin /usr/local/bin /opt /srv; do verify_secure_path "$P" || FAIL=1; done
+          INSTALLER_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          NODE_BIN=$(PATH="$INSTALLER_PATH" command -v node 2>/dev/null || true)
+          NPM_BIN=$(PATH="$INSTALLER_PATH" command -v npm 2>/dev/null || true)
+          echo "[INFO] Installer sanitized PATH resolves: node=${NODE_BIN:-<none>} npm=${NPM_BIN:-<none>}"
+          [ -z "$NODE_BIN" ] || { verify_secure_path "$NODE_BIN" || FAIL=1; }
+          [ -z "$NPM_BIN" ] || { verify_secure_path "$NPM_BIN" || FAIL=1; }
+          if [ -d /usr/local/lib/node_modules ]; then
+            BAD=$(find /usr/local/lib/node_modules \( ! -user root -o \( ! -type l -perm /022 \) \) -print -quit 2>/dev/null || true)
+            if [ -n "$BAD" ]; then
+              echo "[ERROR] node_modules tree still unsafe at: $BAD"
+              FAIL=1
+            else
+              echo "[OK] /usr/local/lib/node_modules tree fully root-owned and non-writable"
+            fi
+          fi
+          if [ "$FAIL" != "0" ]; then
+            echo "[ERROR] Host normalization failed - installer would reject this host."
+            exit 1
+          fi
+          echo "[OK] Runner host normalized - secure_path normalization complete; official preflight still required."
+      - name: Resolve Source Commit (before all official downloads)
+        run: |
+          set -euo pipefail
+          REF_SHA="9ef01ceb48459bcc0a539dbb1364fc766cbbde71"
+          if [ -z "$REF_SHA" ]; then
+            REF_SHA=$(git ls-remote https://github.com/Silence-X-Proton/cloudphone-platform.git HEAD | awk '{print $1}')
+          fi
+          [[ "$REF_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Source SHA resolution failed'; exit 1; }
+          printf 'REF_SHA=%s\n' "$REF_SHA" >> "$GITHUB_ENV"
+          echo '[OK] Source resolved to an immutable commit.'
+      - name: Download Pinned Official Scripts
+        run: |
+          set -euo pipefail
+          sudo bash -se -- "$REF_SHA" <<'CP_ROOT'
+          set -euo pipefail
+          set +x
+          umask 077
+          REF_SHA=$1
+          install -d -o root -g root -m 0700 /run/cloudphone-public-test
+          cd /run/cloudphone-public-test
+          for script in bootstrap.sh dependencies.sh preflight.py; do
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 "https://raw.githubusercontent.com/Silence-X-Proton/cloudphone-platform/$REF_SHA/scripts/$script" -o "$script"
+            chmod 0600 "$script"
+          done
+          bash -n bootstrap.sh
+          bash -n dependencies.sh
+          python3 -c 'import ast; ast.parse(open("preflight.py").read())'
+          cat > access-public.pem <<'CP_PUBLIC_KEY'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA0wo8moXW4I2JjfFoWISx
+          prA5/3MZSAcVGb9EL1IwNuuCAgio1MFJT7lBRAIabaLd2Z46lGmCAnYH+fPmsoGx
+          LCDfrWvQr2JcXf/F/WmIRLcBAWUeYHOwlXriAIusJjcJgee5PQFXwa6icyudfYei
+          CJJjfLbs73A4qNcSrcfwj7Bk8koGhqijBGvERPK+plqpHFjm4VTgvcCSceb/1OWn
+          OoX+7CmNR/SbNxOHGaLaRZF7Qbb1wg/xTrNJypcrMnAkYV+imBwaiserlDH1s+to
+          nq7v1zQUgKKL655VaxG1fKq2XhBP1c9OrbkmMWlvMwVqCBrwBQMhxiQ7uxO0URMS
+          erC8tdd4ypiCuQiCABKB2THMf/pM3VW2D82uPs3vhXY3UWyJr7G9SHz832m0wryL
+          m5Cho5u0Ab1g0Sc5RDW/+McouUeei8m3FhUF1M/W6NMQODhQrp4R1PeFHF6tr3zl
+          xGAxBzsk/sNV0qQfoW7tV9vx3gfowyve52lJUoFaDHnlAgMBAAE=
+          -----END PUBLIC KEY-----
+          CP_PUBLIC_KEY
+          chmod 0644 access-public.pem
+          openssl pkey -pubin -in access-public.pem -noout >/dev/null 2>&1
+          CP_ROOT
+      - name: Official Dependencies (before preflight)
+        run: |
+          set -euo pipefail
+          sudo bash -se -- "$REF_SHA" <<'CP_ROOT'
+          set -euo pipefail
+          set +x
+          umask 077
+          REF_SHA=$1
+          cd /run/cloudphone-public-test
+          if bash dependencies.sh --accept-host-changes > dependencies.log 2>&1; then
+            echo '[OK] Official dependencies completed.'
+          else
+            echo '::error::Official dependencies failed; raw output retained root-only.'
+            exit 1
+          fi
+          CP_ROOT
+      - name: Installer Preflight Probe (strict read-only checks)
+        run: |
+          set -euo pipefail
+          sudo bash -se -- "$REF_SHA" <<'CP_ROOT'
+          set -euo pipefail
+          set +x
+          umask 077
+          REF_SHA=$1
+          cd /run/cloudphone-public-test
+          if python3 preflight.py standalone 8790 > preflight.json 2> preflight-error.log; then
+            echo '[OK] All official preflight checks passed.'
+          else
+            echo '::error::Official preflight rejected host; no installation attempted.'
+            exit 1
+          fi
+          CP_ROOT
+      - name: Install Cloudphone Platform (STANDALONE Mode)
+        run: |
+          set -euo pipefail
+          sudo bash -se -- "$REF_SHA" <<'CP_ROOT'
+          set -euo pipefail
+          set +x
+          umask 077
+          REF_SHA=$1
+          cd /run/cloudphone-public-test
+          if bash bootstrap.sh --ref "$REF_SHA" --mode standalone --port 8790 --accept-host-changes --accept-android-sdk-license </dev/null > install.log 2>&1; then
+            echo '[OK] Installer completed successfully; managed services and tunnel created by installer.'
+          else
+            echo '::error::Installation failed; raw output retained root-only, not copied to public logs.'
+            exit 1
+          fi
+          CP_ROOT
+      - name: Wait for Managed Services and Encrypt Access
+        run: |
+          set -euo pipefail
+          sudo bash -se -- "$REF_SHA" <<'CP_ROOT'
+          set -euo pipefail
+          set +x
+          umask 077
+          REF_SHA=$1
+          cd /run/cloudphone-public-test
+          ready=no
+          for attempt in $(seq 1 60); do
+            if systemctl is-active --quiet cloudphone-platform.service &&
+               systemctl is-active --quiet cloudphone-platform-broker.service &&
+               systemctl is-active --quiet cloudphone-platform-tunnel.service &&
+               python3 - <<'CP_ORIGIN'
+          import json, re, subprocess, sys
+          try:
+              with open('/etc/cloudphone-platform-web/config.json') as f:
+                  config = json.load(f)
+              origin = config['publicOrigin']
+              invocation = subprocess.check_output(['systemctl', 'show', 'cloudphone-platform-tunnel.service', '-p', 'InvocationID', '--value'], text=True).strip()
+              if not re.fullmatch(r'https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com', origin):
+                  sys.exit(1)
+              if not re.fullmatch(r'[a-f0-9]{32}', invocation) or config.get('tunnelInvocationId') != invocation:
+                  sys.exit(1)
+              with open('managed-url', 'w') as f:
+                  f.write(origin + '\n')
+          except Exception:
+              sys.exit(1)
+          CP_ORIGIN
+            then
+              if curl --fail --silent --output /dev/null --max-time 3 http://127.0.0.1:8790/; then ready=yes; break; fi
+            fi
+            sleep 2
+          done
+          [ "$ready" = yes ] || { echo '::error::Managed services/current tunnel readiness timed out'; exit 1; }
+          password=/var/lib/cloudphone-platform/initial-admin-password
+          [ -f "$password" ] && [ ! -L "$password" ] && [ -s "$password" ] || { echo '::error::Initial admin password unavailable'; exit 1; }
+          chown root:root "$password" managed-url
+          chmod 0600 "$password" managed-url
+          openssl pkeyutl -encrypt -pubin -inkey access-public.pem -in "$password" -out admin.enc -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 2>encrypt-error.log
+          openssl pkeyutl -encrypt -pubin -inkey access-public.pem -in managed-url -out url.enc -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 2>>encrypt-error.log
+          printf 'CP_ENCRYPTED_ADMIN='; base64 -w0 admin.enc; printf '\n'
+          printf 'CP_ENCRYPTED_URL='; base64 -w0 url.enc; printf '\n'
+          echo '[OK] Login username: admin. Decrypt ciphertext locally with your private key; never publish plaintext.'
+          CP_ROOT
+      - name: Failure Diagnostics (no raw journal messages)
+        if: ${{ failure() }}
+        run: |
+          set -euo pipefail
+          for unit in cloudphone-platform.service cloudphone-platform-broker.service cloudphone-platform-tunnel.service cloudphone-platform-origin.service; do
+            echo "[INFO] $unit"
+            sudo systemctl show "$unit" --property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus --no-pager 2>/dev/null | grep -E '^(LoadState|ActiveState|SubState|Result|ExecMainCode|ExecMainStatus)=[a-z0-9_-]+$' || true
+            # Free-form status/journal messages can contain URLs or credentials. Emit only a bounded error count.
+            count=$(sudo journalctl -u "$unit" --priority=err --lines=20 --output=json --quiet --no-pager 2>/dev/null | wc -l)
+            echo "Recent error entries (capped at 20; contents withheld): $count"
+          done
+          grep -E '^Mem(Total|Available):' /proc/meminfo
+          df -h / /opt /var/lib
+          ls -l /dev/kvm 2>/dev/null || true
+      - name: Encrypt Diagnostics Bundle
+        id: encrypt_diagnostics
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          set +x
+          if sudo bash -se >/dev/null 2>&1 <<'CP_BUNDLE'
+          set -euo pipefail
+          set +x
+          umask 077
+          work=$(mktemp -d /run/cloudphone-diagnostics.XXXXXX)
+          trap 'rm -rf -- "$work"' EXIT
+          mkdir -m 0700 "$work/bundle" "$work/bundle/logs" "$work/bundle/systemd"
+          cat > "$work/access-public.pem" <<'CP_PUBLIC_KEY'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA0wo8moXW4I2JjfFoWISx
+          prA5/3MZSAcVGb9EL1IwNuuCAgio1MFJT7lBRAIabaLd2Z46lGmCAnYH+fPmsoGx
+          LCDfrWvQr2JcXf/F/WmIRLcBAWUeYHOwlXriAIusJjcJgee5PQFXwa6icyudfYei
+          CJJjfLbs73A4qNcSrcfwj7Bk8koGhqijBGvERPK+plqpHFjm4VTgvcCSceb/1OWn
+          OoX+7CmNR/SbNxOHGaLaRZF7Qbb1wg/xTrNJypcrMnAkYV+imBwaiserlDH1s+to
+          nq7v1zQUgKKL655VaxG1fKq2XhBP1c9OrbkmMWlvMwVqCBrwBQMhxiQ7uxO0URMS
+          erC8tdd4ypiCuQiCABKB2THMf/pM3VW2D82uPs3vhXY3UWyJr7G9SHz832m0wryL
+          m5Cho5u0Ab1g0Sc5RDW/+McouUeei8m3FhUF1M/W6NMQODhQrp4R1PeFHF6tr3zl
+          xGAxBzsk/sNV0qQfoW7tV9vx3gfowyve52lJUoFaDHnlAgMBAAE=
+          -----END PUBLIC KEY-----
+          CP_PUBLIC_KEY
+          chmod 0644 "$work/access-public.pem"
+          openssl pkey -pubin -in "$work/access-public.pem" -noout
+          # Copy only regular files, never follow symlinks or include directories recursively.
+          if [ -d /run/cloudphone-public-test ] && [ ! -L /run/cloudphone-public-test ]; then
+            find /run/cloudphone-public-test -maxdepth 1 -type f \( -name '*.log' -o -name 'preflight.json' -o -name 'managed-url' \) -exec cp --no-dereference --target-directory="$work/bundle/logs" -- {} +
+          fi
+          for file in /etc/cloudphone-platform-web/config.json /var/lib/cloudphone-platform/initial-admin-password; do
+            if [ -f "$file" ] && [ ! -L "$file" ]; then
+              cp --no-dereference -- "$file" "$work/bundle/$(basename "$file")"
+            fi
+          done
+          for unit in cloudphone-platform.service cloudphone-platform-broker.service cloudphone-platform-tunnel.service cloudphone-platform-origin.service; do
+            systemctl status "$unit" --no-pager --full > "$work/bundle/systemd/$unit.status" 2>&1 || true
+            journalctl -u "$unit" -b --lines=2000 --no-pager --output=short-iso > "$work/bundle/systemd/$unit.journal" 2>&1 || true
+          done
+          {
+            ls -ld /usr/bin/node /usr/bin/npm /dev/kvm /opt /var/lib
+            free -m
+            df -h / /opt /var/lib
+          } > "$work/bundle/host.txt" 2>&1 || true
+          chmod -R go-rwx "$work/bundle"
+          tar -czf "$work/diagnostics.tar.gz" -C "$work/bundle" .
+          openssl rand -base64 48 > "$work/password"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass file:"$work/password" -in "$work/diagnostics.tar.gz" -out "$work/diagnostics.enc"
+          openssl pkeyutl -encrypt -pubin -inkey "$work/access-public.pem" -in "$work/password" -out "$work/key.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test -s "$work/diagnostics.enc"
+          test -s "$work/key.enc"
+          # mkdir fails closed if the publication path already exists, including symlinks.
+          mkdir -m 0700 /tmp/cloudphone-encrypted
+          install -o root -g root -m 0644 "$work/diagnostics.enc" /tmp/cloudphone-encrypted/diagnostics.enc
+          install -o root -g root -m 0644 "$work/key.enc" /tmp/cloudphone-encrypted/key.enc
+          # Only ciphertext becomes readable by the upload action; plaintext stays root-only.
+          chmod 0755 /tmp/cloudphone-encrypted
+          CP_BUNDLE
+          then
+            echo '[OK] Encrypted diagnostics prepared; plaintext remains private.'
+          else
+            echo '::error::Diagnostics encryption failed; artifact upload is disabled.'
+            exit 1
+          fi
+      - name: Upload Encrypted Diagnostics (before keep-alive)
+        if: ${{ always() && steps.encrypt_diagnostics.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-diagnostics
+          path: |-
+            /tmp/cloudphone-encrypted/diagnostics.enc
+            /tmp/cloudphone-encrypted/key.enc
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+      - name: Keep Alive Monitor (60 minutes; 90-minute job limit)
+        if: ${{ success() }}
+        run: |
+          echo '[INFO] Public-test access window: 60 minutes after readiness, capped by 90-minute total job timeout.'
+          sleep 3600
